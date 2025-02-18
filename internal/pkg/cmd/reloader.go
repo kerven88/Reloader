@@ -1,20 +1,26 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"github.com/stakater/Reloader/internal/pkg/constants"
+	"net/http"
 	"os"
 	"strings"
 
+	"github.com/stakater/Reloader/internal/pkg/constants"
+	"github.com/stakater/Reloader/internal/pkg/leadership"
+
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/stakater/Reloader/internal/pkg/controller"
 	"github.com/stakater/Reloader/internal/pkg/metrics"
 	"github.com/stakater/Reloader/internal/pkg/options"
 	"github.com/stakater/Reloader/internal/pkg/util"
 	"github.com/stakater/Reloader/pkg/kube"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // NewReloaderCommand starts the reloader controller
@@ -27,34 +33,57 @@ func NewReloaderCommand() *cobra.Command {
 	}
 
 	// options
+	cmd.PersistentFlags().BoolVar(&options.AutoReloadAll, "auto-reload-all", false, "Auto reload all resources")
 	cmd.PersistentFlags().StringVar(&options.ConfigmapUpdateOnChangeAnnotation, "configmap-annotation", "configmap.reloader.stakater.com/reload", "annotation to detect changes in configmaps, specified by name")
 	cmd.PersistentFlags().StringVar(&options.SecretUpdateOnChangeAnnotation, "secret-annotation", "secret.reloader.stakater.com/reload", "annotation to detect changes in secrets, specified by name")
-	cmd.PersistentFlags().StringVar(&options.ReloaderAutoAnnotation, "auto-annotation", "reloader.stakater.com/auto", "annotation to detect changes in secrets")
+	cmd.PersistentFlags().StringVar(&options.ReloaderAutoAnnotation, "auto-annotation", "reloader.stakater.com/auto", "annotation to detect changes in secrets/configmaps")
+	cmd.PersistentFlags().StringVar(&options.ConfigmapReloaderAutoAnnotation, "configmap-auto-annotation", "configmap.reloader.stakater.com/auto", "annotation to detect changes in configmaps")
+	cmd.PersistentFlags().StringVar(&options.SecretReloaderAutoAnnotation, "secret-auto-annotation", "secret.reloader.stakater.com/auto", "annotation to detect changes in secrets")
 	cmd.PersistentFlags().StringVar(&options.AutoSearchAnnotation, "auto-search-annotation", "reloader.stakater.com/search", "annotation to detect changes in configmaps or secrets tagged with special match annotation")
-	cmd.PersistentFlags().StringVar(&options.SearchMatchAnnotation, "search-match-annotation", "reloader.stakater.com/match", "annotation to mark secrets or configmapts to match the search")
-	cmd.PersistentFlags().StringVar(&options.LogFormat, "log-format", "", "Log format to use (empty string for text, or JSON")
+	cmd.PersistentFlags().StringVar(&options.SearchMatchAnnotation, "search-match-annotation", "reloader.stakater.com/match", "annotation to mark secrets or configmaps to match the search")
+	cmd.PersistentFlags().StringVar(&options.LogFormat, "log-format", "", "Log format to use (empty string for text, or JSON)")
+	cmd.PersistentFlags().StringVar(&options.LogLevel, "log-level", "info", "Log level to use (trace, debug, info, warning, error, fatal and panic)")
+	cmd.PersistentFlags().StringVar(&options.WebhookUrl, "webhook-url", "", "webhook to trigger instead of performing a reload")
 	cmd.PersistentFlags().StringSlice("resources-to-ignore", []string{}, "list of resources to ignore (valid options 'configMaps' or 'secrets')")
 	cmd.PersistentFlags().StringSlice("namespaces-to-ignore", []string{}, "list of namespaces to ignore")
+	cmd.PersistentFlags().StringSlice("namespace-selector", []string{}, "list of key:value labels to filter on for namespaces")
+	cmd.PersistentFlags().StringSlice("resource-label-selector", []string{}, "list of key:value labels to filter on for configmaps and secrets")
 	cmd.PersistentFlags().StringVar(&options.IsArgoRollouts, "is-Argo-Rollouts", "false", "Add support for argo rollouts")
 	cmd.PersistentFlags().StringVar(&options.ReloadStrategy, constants.ReloadStrategyFlag, constants.EnvVarsReloadStrategy, "Specifies the desired reload strategy")
+	cmd.PersistentFlags().StringVar(&options.ReloadOnCreate, "reload-on-create", "false", "Add support to watch create events")
+	cmd.PersistentFlags().StringVar(&options.ReloadOnDelete, "reload-on-delete", "false", "Add support to watch delete events")
+	cmd.PersistentFlags().BoolVar(&options.EnableHA, "enable-ha", false, "Adds support for running multiple replicas via leadership election")
+	cmd.PersistentFlags().BoolVar(&options.SyncAfterRestart, "sync-after-restart", false, "Sync add events after reloader restarts")
 
 	return cmd
 }
 
 func validateFlags(*cobra.Command, []string) error {
 	// Ensure the reload strategy is one of the following...
+	var validReloadStrategy bool
 	valid := []string{constants.EnvVarsReloadStrategy, constants.AnnotationsReloadStrategy}
 	for _, s := range valid {
 		if s == options.ReloadStrategy {
-			return nil
+			validReloadStrategy = true
 		}
 	}
 
-	err := fmt.Sprintf("%s must be one of: %s", constants.ReloadStrategyFlag, strings.Join(valid, ", "))
-	return errors.New(err)
+	if !validReloadStrategy {
+		err := fmt.Sprintf("%s must be one of: %s", constants.ReloadStrategyFlag, strings.Join(valid, ", "))
+		return errors.New(err)
+	}
+
+	// Validate that HA options are correct
+	if options.EnableHA {
+		if err := validateHAEnvs(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func configureLogging(logFormat string) error {
+func configureLogging(logFormat, logLevel string) error {
 	switch logFormat {
 	case "json":
 		logrus.SetFormatter(&logrus.JSONFormatter{})
@@ -64,11 +93,36 @@ func configureLogging(logFormat string) error {
 			return fmt.Errorf("unsupported logging formatter: %q", logFormat)
 		}
 	}
+	// set log level
+	level, err := logrus.ParseLevel(logLevel)
+	if err != nil {
+		return err
+	}
+	logrus.SetLevel(level)
 	return nil
 }
 
+func validateHAEnvs() error {
+	podName, podNamespace := getHAEnvs()
+
+	if podName == "" {
+		return fmt.Errorf("%s not set, cannot run in HA mode without %s set", constants.PodNameEnv, constants.PodNameEnv)
+	}
+	if podNamespace == "" {
+		return fmt.Errorf("%s not set, cannot run in HA mode without %s set", constants.PodNamespaceEnv, constants.PodNamespaceEnv)
+	}
+	return nil
+}
+
+func getHAEnvs() (string, string) {
+	podName := os.Getenv(constants.PodNameEnv)
+	podNamespace := os.Getenv(constants.PodNamespaceEnv)
+
+	return podName, podNamespace
+}
+
 func startReloader(cmd *cobra.Command, args []string) {
-	err := configureLogging(options.LogFormat)
+	err := configureLogging(options.LogFormat, options.LogLevel)
 	if err != nil {
 		logrus.Warn(err)
 	}
@@ -96,18 +150,47 @@ func startReloader(cmd *cobra.Command, args []string) {
 		logrus.Fatal(err)
 	}
 
+	namespaceLabelSelector, err := getNamespaceLabelSelector(cmd)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	resourceLabelSelector, err := getResourceLabelSelector(cmd)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	if len(namespaceLabelSelector) > 0 {
+		logrus.Warnf("namespace-selector is set, will only detect changes in namespaces with these labels: %s.", namespaceLabelSelector)
+	}
+
+	if len(resourceLabelSelector) > 0 {
+		logrus.Warnf("resource-label-selector is set, will only detect changes on resources with these labels: %s.", resourceLabelSelector)
+	}
+
+	if options.WebhookUrl != "" {
+		logrus.Warnf("webhook-url is set, will only send webhook, no resources will be reloaded")
+	}
+
 	collectors := metrics.SetupPrometheusEndpoint()
 
+	var controllers []*controller.Controller
 	for k := range kube.ResourceMap {
-		if ignoredResourcesList.Contains(k) {
+		if ignoredResourcesList.Contains(k) || (len(namespaceLabelSelector) == 0 && k == "namespaces") {
 			continue
 		}
 
-		c, err := controller.NewController(clientset, k, currentNamespace, ignoredNamespacesList, collectors)
+		c, err := controller.NewController(clientset, k, currentNamespace, ignoredNamespacesList, namespaceLabelSelector, resourceLabelSelector, collectors)
 		if err != nil {
 			logrus.Fatalf("%s", err)
 		}
 
+		controllers = append(controllers, c)
+
+		// If HA is enabled we only run the controller when
+		if options.EnableHA {
+			continue
+		}
 		// Now let's start the controller
 		stop := make(chan struct{})
 		defer close(stop)
@@ -115,12 +198,89 @@ func startReloader(cmd *cobra.Command, args []string) {
 		go c.Run(1, stop)
 	}
 
-	// Wait forever
-	select {}
+	// Run leadership election
+	if options.EnableHA {
+		podName, podNamespace := getHAEnvs()
+		lock := leadership.GetNewLock(clientset.CoordinationV1(), constants.LockName, podName, podNamespace)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go leadership.RunLeaderElection(lock, ctx, cancel, podName, controllers)
+	}
+
+	leadership.SetupLivenessEndpoint()
+	logrus.Fatal(http.ListenAndServe(constants.DefaultHttpListenAddr, nil))
 }
 
 func getIgnoredNamespacesList(cmd *cobra.Command) (util.List, error) {
 	return getStringSliceFromFlags(cmd, "namespaces-to-ignore")
+}
+
+func getNamespaceLabelSelector(cmd *cobra.Command) (string, error) {
+	slice, err := getStringSliceFromFlags(cmd, "namespace-selector")
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	for i, kv := range slice {
+		// Legacy support for ":" as a delimiter and "*" for wildcard.
+		if strings.Contains(kv, ":") {
+			split := strings.Split(kv, ":")
+			if split[1] == "*" {
+				slice[i] = split[0]
+			} else {
+				slice[i] = split[0] + "=" + split[1]
+			}
+		}
+		// Convert wildcard to valid apimachinery operator
+		if strings.Contains(kv, "=") {
+			split := strings.Split(kv, "=")
+			if split[1] == "*" {
+				slice[i] = split[0]
+			}
+		}
+	}
+
+	namespaceLabelSelector := strings.Join(slice[:], ",")
+	_, err = labels.Parse(namespaceLabelSelector)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	return namespaceLabelSelector, nil
+}
+
+func getResourceLabelSelector(cmd *cobra.Command) (string, error) {
+	slice, err := getStringSliceFromFlags(cmd, "resource-label-selector")
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	for i, kv := range slice {
+		// Legacy support for ":" as a delimiter and "*" for wildcard.
+		if strings.Contains(kv, ":") {
+			split := strings.Split(kv, ":")
+			if split[1] == "*" {
+				slice[i] = split[0]
+			} else {
+				slice[i] = split[0] + "=" + split[1]
+			}
+		}
+		// Convert wildcard to valid apimachinery operator
+		if strings.Contains(kv, "=") {
+			split := strings.Split(kv, "=")
+			if split[1] == "*" {
+				slice[i] = split[0]
+			}
+		}
+	}
+
+	resourceLabelSelector := strings.Join(slice[:], ",")
+	_, err = labels.Parse(resourceLabelSelector)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	return resourceLabelSelector, nil
 }
 
 func getStringSliceFromFlags(cmd *cobra.Command, flag string) ([]string, error) {

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "rebaseWhen": "never",
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  },
+
+  "customManagers": [
+    {
+        "customType": "regex",
+        "fileMatch": [
+            ".vale.ini"
+        ],
+        "matchStrings": [
+            "https:\/\/github\\.com\/(?<depName>.*)\/releases\/download\/(?<currentValue>.*)\/.*\\.zip"
+        ],
+        "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "Update Helm Chart values file",
+      "fileMatch": [
+          "values\\.yaml$"
+      ],
+      "matchStrings": [
+          "image:\\s*name: (?<depName>[a-zA-Z0-9\\.\\/]*)\\s*tag: (?<currentValue>[a-zA-Z0-9\\.\\/]*)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

@@ -1,10 +1,8 @@
-# Generated from deployments/kubernetes/templates/chart/Chart.yaml.tmpl
-
 apiVersion: v1
 name: reloader
 description: Reloader chart that runs on kubernetes
-version: v0.0.105
-appVersion: v0.0.105
+version: 1.3.0
+appVersion: v1.3.0
 keywords:
   - Reloader
   - kubernetes
@@ -16,16 +14,6 @@ maintainers:
   - name: Stakater
     email: hello@stakater.com
   - name: rasheedamir
-    email: rasheed@aurorasolutions.io
-  - name: waseem-h
-    email: waseemhassan@stakater.com
+    email: rasheed@stakater.com
   - name: faizanahmad055
-    email: faizan.ahmad55@outlook.com
-  - name: kahootali
-    email: ali.kahoot@aurorasolutions.io
-  - name: ahmadiq
-    email: ahmad@aurorasolutions.io
-  - name: ahsan-storm
-    email: ahsanmuhammad1@outlook.com
-  - name: ahmedwaleedmalik
-    email: waleed@stakater.com
+    email: faizan@stakater.com

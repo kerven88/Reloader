@@ -10,3 +10,10 @@ _gopath/
 vendor
 dist
 Reloader
+!**/chart/reloader
+*.tgz
+styles/
+site/
+/mkdocs.yml
+yq
+bin

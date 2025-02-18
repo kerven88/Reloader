@@ -22,10 +22,27 @@ We truncate at 63 chars because some Kubernetes name fields are limited to this 
 
 {{- define "reloader-labels.chart" -}}
 app: {{ template "reloader-fullname" . }}
-chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
+chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
 release: {{ .Release.Name | quote }}
 heritage: {{ .Release.Service | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+{{- end -}}
+
+{{/*
+Create pod anti affinity labels
+*/}}
+{{- define "reloader-podAntiAffinity" -}}
+podAntiAffinity:
+  preferredDuringSchedulingIgnoredDuringExecution:
+  - weight: 100
+    podAffinityTerm:
+      labelSelector:
+        matchExpressions:
+        - key: app
+          operator: In
+          values:
+          - {{ template "reloader-fullname" . }}
+      topologyKey: "kubernetes.io/hostname"
 {{- end -}}
 
 {{/*

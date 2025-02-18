@@ -1,10 +1,12 @@
 package controller
 
 import (
-	"github.com/stakater/Reloader/internal/pkg/constants"
+	"context"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/stakater/Reloader/internal/pkg/constants"
 
 	"github.com/stakater/Reloader/internal/pkg/metrics"
 
@@ -14,7 +16,10 @@ import (
 	"github.com/stakater/Reloader/internal/pkg/testutil"
 	"github.com/stakater/Reloader/internal/pkg/util"
 	"github.com/stakater/Reloader/pkg/kube"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -40,7 +45,10 @@ func TestMain(m *testing.M) {
 
 	logrus.Infof("Creating controller")
 	for k := range kube.ResourceMap {
-		c, err := NewController(clients.KubernetesClient, k, namespace, []string{}, collectors)
+		if k == "namespaces" {
+			continue
+		}
+		c, err := NewController(clients.KubernetesClient, k, namespace, []string{}, "", "", collectors)
 		if err != nil {
 			logrus.Fatalf("%s", err)
 		}
@@ -2200,7 +2208,7 @@ func TestController_resourceInIgnoredNamespace(t *testing.T) {
 	type fields struct {
 		client            kubernetes.Interface
 		indexer           cache.Indexer
-		queue             workqueue.RateLimitingInterface
+		queue             workqueue.TypedRateLimitingInterface[any]
 		informer          cache.Controller
 		namespace         string
 		ignoredNamespaces util.List
@@ -2275,6 +2283,197 @@ func TestController_resourceInIgnoredNamespace(t *testing.T) {
 			}
 			if got := c.resourceInIgnoredNamespace(tt.args.raw); got != tt.want {
 				t.Errorf("Controller.resourceInIgnoredNamespace() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestController_resourceInNamespaceSelector(t *testing.T) {
+	type fields struct {
+		indexer           cache.Indexer
+		queue             workqueue.TypedRateLimitingInterface[any]
+		informer          cache.Controller
+		namespace         v1.Namespace
+		namespaceSelector string
+	}
+	type args struct {
+		raw interface{}
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   bool
+	}{
+		{
+			name: "TestConfigMapResourceInNamespaceSelector",
+			fields: fields{
+				namespaceSelector: "select=this,select2=this2",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select":  "this",
+							"select2": "this2",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetConfigmap("selected-namespace", "testcm", "test"),
+			},
+			want: true,
+		}, {
+			name: "TestConfigMapResourceNotInNamespaceSelector",
+			fields: fields{
+				namespaceSelector: "select=this,select2=this2",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "not-selected-namespace",
+						Labels: map[string]string{},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetConfigmap("not-selected-namespace", "testcm", "test"),
+			},
+			want: false,
+		},
+		{
+			name: "TestSecretResourceInNamespaceSelector",
+			fields: fields{
+				namespaceSelector: "select=this,select2=this2",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select":  "this",
+							"select2": "this2",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("selected-namespace", "testsecret", "test"),
+			},
+			want: true,
+		}, {
+			name: "TestSecretResourceNotInNamespaceSelector",
+			fields: fields{
+				namespaceSelector: "select=this,select2=this2",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "not-selected-namespace",
+						Labels: map[string]string{},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("not-selected-namespace", "secret", "test"),
+			},
+			want: false,
+		}, {
+			name: "TestSecretResourceInNamespaceSelectorKeyExists",
+			fields: fields{
+				namespaceSelector: "select",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select": "this",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("selected-namespace", "secret", "test"),
+			},
+			want: true,
+		}, {
+			name: "TestSecretResourceInNamespaceSelectorValueIn",
+			fields: fields{
+				namespaceSelector: "select in (select1, select2, select3)",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select": "select2",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("selected-namespace", "secret", "test"),
+			},
+			want: true,
+		}, {
+			name: "TestSecretResourceInNamespaceSelectorKeyDoesNotExist",
+			fields: fields{
+				namespaceSelector: "!select2",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select": "this",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("selected-namespace", "secret", "test"),
+			},
+			want: true,
+		}, {
+			name: "TestSecretResourceInNamespaceSelectorMultipleConditions",
+			fields: fields{
+				namespaceSelector: "select,select2=this2,select3!=this4",
+				namespace: v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "selected-namespace",
+						Labels: map[string]string{
+							"select":  "this",
+							"select2": "this2",
+							"select3": "this3",
+						},
+					},
+				},
+			},
+			args: args{
+				raw: testutil.GetSecret("selected-namespace", "secret", "test"),
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset()
+			namespace, _ := fakeClient.CoreV1().Namespaces().Create(context.Background(), &tt.fields.namespace, metav1.CreateOptions{})
+			logrus.Infof("created fakeClient namespace for testing = %s", namespace.Name)
+
+			c := &Controller{
+				client:            fakeClient,
+				indexer:           tt.fields.indexer,
+				queue:             tt.fields.queue,
+				informer:          tt.fields.informer,
+				namespace:         tt.fields.namespace.ObjectMeta.Name,
+				namespaceSelector: tt.fields.namespaceSelector,
+			}
+
+			listOptions := metav1.ListOptions{}
+			listOptions.LabelSelector = tt.fields.namespaceSelector
+			namespaces, _ := fakeClient.CoreV1().Namespaces().List(context.Background(), listOptions)
+
+			for _, ns := range namespaces.Items {
+				c.addSelectedNamespaceToCache(ns)
+			}
+
+			if got := c.resourceInSelectedNamespaces(tt.args.raw); got != tt.want {
+				t.Errorf("Controller.resourceInNamespaceSelector() = %v, want %v", got, tt.want)
+			}
+
+			for _, ns := range namespaces.Items {
+				c.removeSelectedNamespaceFromCache(ns)
 			}
 		})
 	}
